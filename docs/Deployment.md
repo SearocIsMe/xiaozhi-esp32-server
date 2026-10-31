@@ -1233,3 +1233,134 @@ INFO-发送第一段语音: <画面描述>
   其描述质量、中文表达风格、对复杂场景的准确性**未做系统评测**；
 - 视觉链路不影响文本对话主链路，二者 provider 独立配置。
 
+---
+
+## 附七：语音识别「对我的声音很陌生」—— 锁定中文语种
+
+> 现象：设备能唤醒、能对话，但识别结果经常是英文/韩文乱码，像是"听不懂我说话"。
+> **根因：ASR `language = "auto"` 启用了自动语种识别（LID），中文被判成 en/ko。**
+
+### 1. 关键证据：中文识别本身是准确的
+
+同一台设备、同一麦克风，服务端日志的时间序列：
+
+| 时间 | 识别语言 | 识别文本 | 判定 |
+|---|---|---|---|
+| 20:47:00 | **zh** | `先打开摄像头。` | ✅ 完全正确 |
+| 20:48:28 | **zh** | `请打开摄像头。` | ✅ 完全正确 |
+| 21:13:29 | **en** | `No there's don't.` | ❌ 语种误判 |
+| 21:13:56 | zh | `摄像头。` | ⚠️ 截断 |
+| 21:14:23 | **ko** | `채무.`（韩语） | ❌ 语种误判 |
+
+**结论**：麦克风硬件、I2S 接线、采样率、VAD、模型加载**全部正常**。
+问题在于 SenseVoice 的**自动语种识别**在音频质量一般（音量小/距离远/有噪声）时误判。
+
+### 2. 机制（源码级）
+
+[`core/providers/asr/fun_local.py`](../../main/xiaozhi-server/core/providers/asr/fun_local.py)：
+
+```python
+self.language = config.get("language", "auto")     # 默认 auto
+
+result = await asyncio.to_thread(
+    self.model.generate,
+    input=artifacts.pcm_bytes,
+    cache={},
+    language=self.language,          # ← 传给 SenseVoice
+    use_itn=True,
+    batch_size_s=60,
+)
+text = lang_tag_filter(result[0]["text"])          # 解析 <|zh|> <|en|> 等标签
+```
+
+- `language="auto"` → 模型自行做 LID，输出 `<|en|>` 等标签，正文即为英文音译/乱码；
+- `language="zh"` → 跳过 LID，强制按中文解码。
+
+日志中 `识别语言: en` 正是 [`base.py:135-136`](../../main/xiaozhi-server/core/providers/asr/base.py)
+打印的 `raw_text["language"]`，即 LID 的判定结果。
+
+### 3. 智控台 UI 有没有这个参数？**没有**
+
+核对 [`manager-web/src/views/roleConfig.vue`](../../main/manager-web/src/views/roleConfig.vue)：
+所有 `language` 字段（第 162/183/365-380 行等）都是 **TTS 音色语言**，
+**ASR 的 `language` 未在 UI 暴露**。因此只能改数据库或 `.config.yaml`。
+
+### 4. 修复步骤（实测有效）
+
+**① 改数据库**
+
+```sql
+-- 仅针对智能体实际引用的 ASR 记录
+UPDATE ai_model_config
+SET config_json = JSON_SET(config_json, '$.language', 'zh')
+WHERE model_type='ASR'
+  AND JSON_UNQUOTE(JSON_EXTRACT(config_json,'$.language')) = 'auto';
+```
+
+仓库脚本：[`scripts/fix_asr_language.sql`](../../../scripts/fix_asr_language.sql)
+
+**② 清服务端缓存 + 重启**
+
+```bash
+docker exec xiaozhi-esp32-server-redis redis-cli FLUSHALL
+docker restart xiaozhi-esp32-server
+```
+
+> **为什么必须清缓存**：`POST /xiaozhi/config/agent-models` 返回的模型配置有 Redis 缓存
+> （[`ConfigServiceImpl.getAgentModels`](../../main/manager-api/src/main/java/xiaozhi/modules/config/service/impl/ConfigServiceImpl.java)），
+> 只改库不重启/不清缓存，服务端仍返回旧值。
+
+**③ 复位设备（不可省略）**
+
+设备连接时会拉取并**缓存私有配置**。改完服务端后必须让设备重新连接
+（拔电重上 / RST），否则日志里仍会看到旧的 `language: "auto"`。
+
+**④ 校验**
+
+```bash
+bash scripts/check_asr_language.sh
+```
+
+实测输出（已通过）：
+
+```
+=== ai_model_config 中所有 ASR 的 language ===
+| ASR_FunASR | FunASR | ASR | fun_local | zh |
+
+=== 设备实际绑定的 ASR 记录 ===
+| 1c:29:04:31:11:88 | ... | ASR_FunASR | zh |
+
+[OK] 近 30 分钟无非中文语种判定
+```
+
+### 5. 为什么「锁定 zh」是对的取舍
+
+| 维度 | 说明 |
+|---|---|
+| 项目定位 | LifeOS 决策门前**评测语言锁定中文**（规格书 §9.6），陪伴场景亦以中文为主 |
+| 代价 | 若有人对设备说英文，识别质量会下降（模型按中文解码） |
+| 收益 | **消除语种误判这一整类失败**，识别结果稳定可预期 |
+| 何时回退 | 若后续需要中英混说，应改用**支持中英混合**的 ASR（如阿里百炼 Paraformer、或 `language` 支持列表的模型），而不是回退到 `auto` |
+
+### 6. 若锁定后仍有问题（子问题 B：音频质量）
+
+语种锁定只解决「被判成外语」。若仍出现**截断/丢字**，属音频质量问题：
+
+| 检查项 | 方法 |
+|---|---|
+| 麦克风增益 | 固件侧 `SetInputGain`；本次串口显示 `NS: off`（未开降噪） |
+| 距离/音量 | 建议 10–30cm、正常音量 |
+| VAD 阈值 | [`config.yaml`](../../main/xiaozhi-server/config.yaml) `VAD.SileroVAD.threshold`（默认 0.5，可试 0.6~0.65） |
+| 回音干扰 | 本板无 AEC（`1 microphone, 0 playback`），播放时降低音量或麦克风远离喇叭 |
+| 唤醒词短促 | 唤醒后先说完整句，避免只蹦一两个词 |
+
+### 7. 排障速查
+
+| 现象 | 首查 |
+|---|---|
+| 识别成英文/韩文/日文 | ASR `language` 是否为 `auto` |
+| 改了库但日志仍是旧值 | 是否清了 Redis + 重启 + **复位设备** |
+| 识别为空 / 一个词 | 音频质量（增益/距离/VAD/回音），见 §6 |
+| `识别语言: zh` 但文本不对 | 可能是同音字/专业词 → 用智能体「替换词」功能纠正 |
+| 完全无 `识别文本` 行 | 音频未上传 → 查 VAD 是否触发、WS 是否建立 |
+
