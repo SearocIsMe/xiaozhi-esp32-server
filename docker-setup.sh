@@ -1,7 +1,14 @@
-#!/bin/sh
+#!/bin/bash
 # 脚本作者@VanillaNahida
 # 本文件是用于一键自动下载本项目所需文件，自动创建好目录
 # 暂且只支持X86版本的Ubuntu系统，其他系统未测试
+#
+# 【2026-10-31 修订】本脚本原先使用 #!/bin/sh 却大量使用 bash 专有语法
+# （[[ ]]、$'\e'、local、echo -e 等）。Ubuntu 的 /bin/sh 指向 dash，
+# 会导致语法错误；且 Esc 检测块在非 TTY（容器 / CI / 管道 stdin）下
+# read 永久阻塞，使脚本挂死。以下改为 bash，并让 Esc 检测仅在真 TTY 下启用。
+
+set -o pipefail
 
 # 定义中断处理函数
 handle_interrupt() {
@@ -14,24 +21,37 @@ handle_interrupt() {
 # 设置信号捕获，处理Ctrl+C
 trap handle_interrupt SIGINT
 
-# 处理Esc键
-# 保存终端设置
-old_stty_settings=$(stty -g)
-# 设置终端立即响应，不回显
-stty -icanon -echo min 1 time 0
+# ---------------------------------------------------------------------------
+# Esc 键中断检测（可选功能）
+# ---------------------------------------------------------------------------
+# 仅在「标准输入是终端」时启用。容器 / CI / `cmd < script` / 管道输入等
+# 非交互场景下 stty 会失败且 read 会永久阻塞，因此必须跳过。
+#
+# 判定方式：`[ -t 0 ]` 检测 stdin 是否为 TTY；`stty -g` 成功才认为可操作终端。
+ESC_WATCH_PID=""
+if [ -t 0 ] && old_stty_settings=$(stty -g 2>/dev/null); then
+    # 设置终端立即响应，不回显
+    if stty -icanon -echo min 1 time 0 2>/dev/null; then
+        # 后台进程检测 Esc 键（read 带 -n1 避免按行缓冲导致的等待）
+        (
+            while true; do
+                # -n1: 读单个字符；读不到（EOF）则退出，避免死循环
+                if ! IFS= read -r -n1 key 2>/dev/null; then
+                    break
+                fi
+                if [ "$key" = "$(printf '\033')" ]; then
+                    kill -SIGINT $$
+                    break
+                fi
+            done
+        ) &
+        ESC_WATCH_PID=$!
 
-# 后台进程检测Esc键
-(while true; do
-    read -r key
-    if [[ $key == $'\e' ]]; then
-        # 检测到Esc键，触发中断处理
-        kill -SIGINT $$
-        break
+        # 脚本结束时恢复终端设置并清理后台监视进程
+        trap 'stty "$old_stty_settings" 2>/dev/null; \
+              [ -n "$ESC_WATCH_PID" ] && kill "$ESC_WATCH_PID" 2>/dev/null' EXIT
     fi
-done) &
-
-# 脚本结束时恢复终端设置
-trap 'stty "$old_stty_settings"' EXIT
+fi
 
 
 # 打印彩色字符画
