@@ -1734,3 +1734,229 @@ manager-api:
 | 设备一直 activating | `server.ota` 不可达（先用 curl 测 `/xiaozhi/ota/`） |
 | 改了参数设备无变化 | 设备缓存：需**复位设备**重新拉配置 |
 
+---
+
+## 附十一：声纹识别（`server.voice_print`）如何配置
+
+> **结论先行**：`server.voice_print` **不是云厂商的 API Key**，而是指向一个
+> **自建声纹识别服务**的 URL。阿里百炼**没有**可直接填用的对等接口。
+
+> 结论先行：`server.voice_print` **不是某个云厂商的 API Key**，而是指向一个**自建声纹识别服务**的 URL。
+> 阿里百炼**没有**可直接填用的对等接口。
+
+---
+
+## 1. 它要的到底是什么（源码级契约）
+
+服务端 `VoiceprintProvider` 的初始化逻辑（`core/utils/voiceprint_provider.py`）：
+
+```python
+self.original_url = config.get("url", "")
+
+parsed_url = urlparse(self.original_url)
+base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+
+# key 必须放在 URL 查询参数里
+self.api_key = parse_qs(parsed_url.query).get('key', [''])[0]
+if not self.api_key:
+    logger.error("URL中未找到key参数，声纹识别将被禁用")
+    self.enabled = False
+
+# 之后固定调用这个路径
+self.api_url = f"{base_url}/voiceprint/identify"
+```
+
+**因此配置值必须是这种形状**：
+
+```
+http://<声纹服务主机>?key=<密钥>
+```
+
+服务端会自动派生：
+
+| 动作 | 实际请求 |
+|---|---|
+| 健康检查 | `GET <base_url>/voiceprint/health`（见 `_check_server_health`） |
+| 识别说话人 | `POST <base_url>/voiceprint/identify`，Header 带 key |
+
+**注意**（manager-api 已内置校验）：
+- 不允许空值：`VOICEPRINT_URL_EMPTY (10115)`
+- **不允许 localhost / 127.0.0.1**：`VOICEPRINT_URL_LOCALHOST (10116)`
+  → 即使自建服务在容器里，也要用**容器名或内网 IP**填写。
+
+---
+
+## 2. 阿里百炼为什么不行
+
+阿里百炼（DashScope）提供的是：
+- Paraformer 语音识别（ASR）
+- 说话人分离（Speaker Diarization，部分模型支持）
+- 声纹注册/比对（部分能力，需按其 OpenAPI 调用）
+
+但这些**都不是**小智所要求的契约：
+- 路径不是 `/voiceprint/identify`
+- 入参不是 `speaker_ids` + 音频
+- 返回不是 `speaker_name`
+- 认证不是 URL `?key=` 形式
+
+**所以无法「填个 URL 就通」**。若要用百炼，必须自己写一个适配层。
+
+---
+
+## 3. 三条可行路径
+
+### 路径 A：不启用（推荐，除非确有需求）
+
+当前 `server.voice_print = null` 时，日志只有 INFO 级 `声纹识别功能未启用`，
+**不影响任何主链路**（唤醒/ASR/LLM/TTS/摄像头均正常）。
+
+**适用场景**：单用户使用、不需要区分说话人。
+
+---
+
+### 路径 B：自建声纹服务（要用就得这么做）
+
+需要一个实现以下 2 个端点的 HTTP 服务：
+
+```
+GET  /voiceprint/health          -> 200 表示可用
+POST /voiceprint/identify        -> 返回识别出的 speaker_id
+```
+
+最小实现可基于开源模型，例如：
+- **Resemblyzer**（轻量，Python，基于 d-vector）
+- **SpeechBrain**（`spkrec-ecapa-voxceleb`，ECAPA-TDNN，效果好）
+- **3D-Speaker**（阿里开源，含 CAM++ 模型）
+
+参考实现骨架（FastAPI + SpeechBrain）：
+
+```python
+# voiceprint_server.py  —— 仅示意，实际需自行完善
+from fastapi import FastAPI, UploadFile, Header, HTTPException
+import torchaudio, torch
+from speechbrain.inference.speaker import EncoderClassifier
+
+app = FastAPI()
+API_KEY = "your-secret-key"
+model = EncoderClassifier.from_hparams(
+    source="speechbrain/spkrec-ecapa-voxceleb",
+    savedir="pretrained_models/spkrec-ecapa-voxceleb",
+)
+
+# speaker_id -> embedding
+ENROLLED: dict[str, torch.Tensor] = {}
+
+
+def _embed(path_or_file) -> torch.Tensor:
+    sig, sr = torchaudio.load(path_or_file)
+    if sr != 16000:
+        sig = torchaudio.transforms.Resample(sr, 16000)(sig)
+    return model.encode_batch(sig).squeeze()
+
+
+@app.get("/voiceprint/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/voiceprint/identify")
+async def identify(file: UploadFile, authorization: str = Header(None)):
+    # 校验 key（小智会用 URL 中的 key 作为凭据）
+    if not authorization or API_KEY not in authorization:
+        raise HTTPException(401, "invalid key")
+
+    audio_path = f"/tmp/{file.filename}"
+    with open(audio_path, "wb") as f:
+        f.write(await file.read())
+
+    emb = _embed(audio_path)
+
+    best_id, best_score = None, -1.0
+    for sid, ref in ENROLLED.items():
+        score = torch.nn.functional.cosine_similarity(emb, ref, dim=0).item()
+        if score > best_score:
+            best_id, best_score = sid, score
+
+    THRESHOLD = 0.4          # 与智控台 similarity_threshold 保持一致
+    if best_score < THRESHOLD:
+        return {"speaker": "unknown", "score": best_score}
+    return {"speaker": best_id, "score": best_score}
+```
+
+部署后用内网地址填写：
+
+```sql
+UPDATE sys_params
+SET param_value = 'http://voiceprint-svc:8010?key=your-secret-key'
+WHERE param_code = 'server.voice_print';
+```
+
+> `voiceprint-svc` 必须是**容器名或内网 IP**（不能用 localhost/127.0.0.1）。
+> 容器与小智服务需在同一 Docker 网络。
+
+---
+
+### 路径 C：用阿里百炼做适配层
+
+在路径 B 的服务里，把本地模型替换为调用百炼的声纹 API：
+
+```python
+# identify() 内部改为：
+#   1) 上传音频到百炼 -> 获取说话人 embedding 或直接比对结果
+#   2) 映射成 {"speaker": "<your_speaker_id>"} 返回
+```
+
+**成本**：相当于自己写一个协议转换网关。工作量明显大于路径 B（本地模型）。
+
+---
+
+## 4. 还需要配套的两件事（容易漏）
+
+仅配 URL 不够，还要：
+
+### 4.1 说话人清单（speakers）
+
+```yaml
+voiceprint:
+  url: http://voiceprint-svc:8010?key=xxx
+  speakers:
+    - "test1,张三,张三是一个程序员"
+    - "test2,李四,李四是一个产品经理"
+  similarity_threshold: 0.4
+```
+
+格式：`speaker_id,显示名,描述`
+
+### 4.2 声纹注册（把某人的声音绑定到 speaker_id）
+
+注册动作在**智控台**完成（`VoicePrint` 页面），后台对应这些错误码可见其流程：
+`VOICEPRINT_REGISTER_*` / `VOICEPRINT_UNREGISTER_*` / `VOICEPRINT_IDENTIFY_*`。
+
+**没有注册过的声音，识别会返回 unknown**——这是正常行为，不是故障。
+
+---
+
+## 5. 判断是否需要启用
+
+| 需求 | 是否需要 |
+|---|---|
+| 单人使用，AI 只要认出「主人」 | ❌ 不需要（用 `subject_id=user` 即可） |
+| 家庭多人共用一台设备，AI 需分辨是谁在说话 | ✅ 需要 |
+| 要做「对不同的人反应不同」（场景二）的真实多人验证 | ✅ 需要 |
+
+> 注意：LifeOS 的**场景二（关系可区分性）**在工程上靠 `MemoryRecord.subject_id` +
+> `RelationshipState` 实现，**不依赖声纹**。声纹只是「自动判定说话人身份」的输入手段之一；
+> 阶段 0/1 可用固定 `subject_id` 手工注入来验证，无需声纹服务。
+
+---
+
+## 6. 排障速查
+
+| 现象 | 原因 |
+|---|---|
+| `声纹识别功能未启用`（INFO） | `url` 为空 —— 正常 |
+| `URL中未找到key参数，声纹识别将被禁用`（ERROR） | URL 少了 `?key=xxx` |
+| `声纹识别服务器不可用，声纹识别已禁用` | 健康检查失败：网络不通/服务未起/路径不对 |
+| `VOICEPRINT_URL_LOCALHOST` | 填了 localhost / 127.0.0.1，改为容器名 |
+| `声纹识别失败: ...` | identify 接口报错，看自建服务日志 |
+| 识别结果总是 unknown | 未注册声纹，或相似度低于 `similarity_threshold`（可适当下调到 0.3） |
