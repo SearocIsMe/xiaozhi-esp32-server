@@ -1364,3 +1364,373 @@ bash scripts/check_asr_language.sh
 | `识别语言: zh` 但文本不对 | 可能是同音字/专业词 → 用智能体「替换词」功能纠正 |
 | 完全无 `识别文本` 行 | 音频未上传 → 查 VAD 是否触发、WS 是否建立 |
 
+---
+
+## 附八：ESP32-S3 固件擦除、构建与烧录（Windows 主机）
+
+> 适用：在 Windows 主机烧录 `bread-compact-wifi-s3cam` 固件（串口 `COM10`）。
+> 下列命令均已实测通过（2026-11-01）。
+
+### 1. 为什么必须在 Windows 侧运行 esptool
+
+`COM10` 是 **Windows 设备名**。WSL 内没有该设备节点（除非用 usbipd 直通，才有 `/dev/ttyUSB*`）。
+在 WSL 执行会得到：
+
+```
+ERROR: Could not open COM10, the port is busy or doesn't exist.
+([Errno 2] could not open port COM10: [Errno 2] No such file or directory: 'COM10')
+```
+
+**结论：esptool 在 Windows 侧执行，工作目录任意。**
+
+### 2. 可用的 Python 解释器
+
+Windows "没有 python" 通常是 PATH 未配置。本项目实测可用：
+
+```
+C:\ProgramData\anaconda3\python.exe                             # 已含 esptool 5.6.0
+C:\Espressif\tools\python\v6.1\venv\Scripts\python.exe       # ESP-IDF 安装器自带
+```
+
+可选加入 PATH：`setx PATH "%PATH%;C:\ProgramData\anaconda3;C:\ProgramData\anaconda3\Scripts"`（重开终端生效）。
+
+### 3. esptool 5.x 命令名变更（高频坑）
+
+esptool **5.x 起命令由下划线改为连字符**：
+
+| 旧（4.x，已废弃） | 新（5.x） |
+|---|---|
+| `erase_flash` | **`erase-flash`** |
+| `erase_region` | **`erase-region`** |
+| `write_flash` | **`write-flash`** |
+
+旧名会提示 `Deprecated: Command 'erase_flash' is deprecated`，部分版本直接失败。
+
+### 4. 整片擦除（会清空 NVS：Wi-Fi 凭据 + 门户设置）
+
+```bat
+C:\ProgramData\anaconda3\python.exe -m esptool --chip esp32s3 -p COM10 -b 460800 erase-flash
+```
+
+实测：
+
+```
+Connected to ESP32-S3 on COM10:
+Chip type: ESP32-S3 (QFN56) (revision v0.2)
+Features: Wi-Fi, BT 5 (LE), Dual Core + LP Core, 240MHz, Embedded PSRAM 8MB
+MAC: 1c:29:04:31:11:88
+Flash memory erased successfully in 10.3 seconds.
+Hard resetting via RTS pin...
+```
+
+**只擦 NVS（保留固件）**：
+
+```bat
+:: NVS 位于 0x9000，大小 0x4000（16KB），见 partitions/v2/16m.csv
+C:\ProgramData\anaconda3\python.exe -m esptool --chip esp32s3 -p COM10 erase-region 0x9000 0x4000
+```
+
+擦除后上电只打印 `invalid header: 0xffffffff` —— **空芯片的正常现象，不是损坏**。
+
+### 5. 构建固件（ESP-IDF v6.1）
+
+#### 5.1 本机环境位置（实测）
+
+| 项 | 路径 |
+|---|---|
+| ESP-IDF 源码 | `C:\esp-all\.espressif\v6.1\esp-idf` |
+| IDF_TOOLS_PATH | `C:\Espressif\tools` |
+| IDF python env | `C:\Espressif\tools\python_env\idf6.1_py3.12_env` |
+
+> 常见错误：`ERROR: ...\python_env\idf6.1_py3.12_env\Scripts\python.exe doesn't exist!`
+> 表示 IDF Python 环境从未创建 → 执行 5.2 一次即可。
+
+#### 5.2 首次安装 IDF 工具链（只需一次）
+
+```bat
+set "IDF_TOOLS_PATH=C:\Espressif\tools"
+set "IDF_PATH=C:\esp-all\.espressif\v6.1\esp-idf"
+cd /d "C:\esp-all\.espressif\v6.1\esp-idf"
+install.bat esp32s3
+```
+
+成功标志：`All done! You can now run: export.bat`
+
+#### 5.3 构建：用官方 `scripts/build.py`（推荐）
+
+它会读取 `main/boards/<board>/config.json` 并自动生成 `sdkconfig_append`，
+避免手改 `sdkconfig` 被重新生成覆盖。
+
+```bat
+set "IDF_TOOLS_PATH=C:\Espressif\tools"
+set "PYTHONUTF8=1"
+cd /d "C:\esp-all\.espressif\v6.1\esp-idf"
+call export.bat
+
+cd /d <仓库根目录>
+python scripts\build.py bread-compact-wifi-s3cam --build-options-json "{\"display_model\":\"LCD_ST7789_240X240\"}"
+```
+
+**关键参数**：
+
+| 参数 | 值 | 说明 |
+|---|---|---|
+| `board` | `bread-compact-wifi-s3cam` | 目录名，同时是 OTA 上报板型 |
+| `display_model` | **`LCD_ST7789_240X240`** | **必须与实物一致**。默认值是 `LCD_ST7789_240X320`（尺寸错误） |
+
+可选 `display_model` 值（`--list-boards --json` 可查全量）：
+`LCD_ST7789_240X320` / `_NO_IPS` / `LCD_ST7789_170X320` / `172X320` / `240X280` /
+**`240X240`** / **`240X240_7PIN`** / `240X135` / `LCD_ST7735_128X160` / `128X128` /
+`LCD_ST7796_320X480` / `LCD_ILI9341_240X320` / **`LCD_GC9A01_240X240`**（圆屏）/ `LCD_NV3030B_240X320`
+
+> `240X240` 与 `240X240_7PIN` 的唯一差别是 **`DISPLAY_SPI_MODE`（0 vs 3）**。
+> 若白屏/花屏，先换 `_7PIN` 试。
+
+其它可选参数：`display_style`(default/wechat)、`multiline_chat`、`wifi_provisioning`(hotspot/blufi)、
+`camera_hmirror`、`camera_vflip`。
+
+#### 5.4 构建产物与分区地址
+
+```
+build/
+├── bootloader/bootloader.bin
+├── partition_table/partition-table.bin
+├── ota_data_initial.bin
+├── xiaozhi.bin                 # 应用固件
+├── generated_assets.bin        # 资源包（字体/表情）
+└── merged-binary.bin           # 已合并以上全部，一键烧录用
+```
+
+实测尺寸：`xiaozhi.bin = 0x2ac700 (2.8MB)`，`merged-binary.bin = 9,651,361 B (9.2MB)`。
+
+| 地址 | 文件 |
+|---|---|
+| `0x0` | `bootloader.bin` |
+| `0x8000` | `partition-table.bin` |
+| `0xd000` | `ota_data_initial.bin` |
+| `0x20000` | `xiaozhi.bin` |
+| `0x800000` | `generated_assets.bin` |
+
+### 6. 烧录
+
+#### 6.1 一键烧录合并镜像（推荐）
+
+```bat
+cd /d <仓库根目录>\build
+
+C:\ProgramData\anaconda3\python.exe -m esptool --chip esp32s3 -p COM10 -b 460800 ^
+  --before default-reset --after hard-reset write-flash ^
+  --flash-mode dio --flash-size 16MB --flash-freq 80m ^
+  0x0 merged-binary.bin
+```
+
+实测：
+
+```
+Flash will be erased from 0x00000000 to 0x00934fff...
+Compressed 9651364 bytes to 2558886...
+Wrote 9651364 bytes (2558886 compressed) at 0x00000000 in 65.9 seconds
+Verifying written data...
+Hash of data verified.
+Hard resetting via RTS pin...
+```
+
+**`Hash of data verified.` 是成功判据。**
+
+#### 6.2 分文件烧录（便于单独更新 assets）
+
+```bat
+C:\ProgramData\anaconda3\python.exe -m esptool --chip esp32s3 -p COM10 -b 460800 ^
+  --before default-reset --after hard-reset write-flash ^
+  --flash-mode dio --flash-size 16MB --flash-freq 80m ^
+  0x0      build\bootloader\bootloader.bin ^
+  0x8000   build\partition_table\partition-table.bin ^
+  0xd000   build\ota_data_initial.bin ^
+  0x20000  build\xiaozhi.bin ^
+  0x800000 build\generated_assets.bin
+```
+
+#### 6.3 使用 `flash_args`
+
+```bat
+cd /d <仓库根目录>\build
+C:\ProgramData\anaconda3\python.exe -m esptool --chip esp32s3 -b 460800 ^
+  --before default-reset --after hard-reset write-flash "@flash_args"
+```
+
+### 7. 烧录后串口验证（判据）
+
+```bat
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\read_serial.ps1 -Port COM10 -Seconds 30
+```
+
+实测正常启动：
+
+```
+I (107) app_init: App version:      2.5.2
+I (111) app_init: Compile time:     Nov  1 2026 12:02:41     ← 确认新固件生效
+I (219) Board: UUID=... SKU=bread-compact-wifi-s3cam         ← 板型正确
+I (399) LcdDisplay: Turning display on                       ← LCD 正常
+I (459) camera: Detected OV3660 camera                       ← 摄像头正常
+I (879) NoAudioCodec: Simplex channels created               ← 音频正常
+I (4749) Assets: assets map size is 1280 KB (partition 8192 KB)
+I (4739) WifiStation: Got IP: 192.168.1.83                   ← 联网
+I (4739) StateMachine: State: starting -> activating         ← 进入激活流程
+```
+
+### 8. 烧录后必做：重新配网 + 填**云端公网** OTA
+
+整片擦除会清空 NVS，以下都要重做：
+
+1. 设备上电进入热点 `Xiaozhi-XXXX`（本次为 `Xiaozhi-1188`）；
+2. 连接后访问 `http://192.168.4.1`；
+3. 选择 Wi-Fi 并**重新输入密码**；
+4. 「**高级选项 → 自定义 OTA 地址**」填云端地址（见附九，务必是公网域名）；
+5. 保存 → 设备重启 → 自动激活。
+
+### 9. 排障速查
+
+| 现象 | 处理 |
+|---|---|
+| `could not open port COM10` | 在 WSL 执行了 → 改到 Windows；或端口被 IDE 占用 |
+| `erase_flash` deprecated | 用 `erase-flash`（连字符） |
+| `python_env\...\python.exe doesn't exist` | 执行一次 `install.bat esp32s3` |
+| `Unicode characters` 警告 | `chcp 65001` 或 `set PYTHONUTF8=1` |
+| 白屏/颜色异常 | `display_model` 选错 → 试 `240X240` / `_7PIN` / `GC9A01` |
+| 上电只打印 `invalid header` | 空芯片，正常；需先烧录 |
+| 未出现 `Hash of data verified` | 烧录失败：查供电与线材 |
+| 烧录后无 Wi-Fi | NVS 已清，需重新配网 |
+
+---
+
+## 附九：云端部署后设备连不上 WebSocket（`ws://…` 握手失败）
+
+> 现象：设备 OTA 成功、进入 activating，但报「无法连接 WebSocket」。
+> 目标地址形如 `ws://ws.tokynflow.com/xiaozhi/v1/`。
+
+### 1. 分层实测（先定位在哪一层失败）
+
+在任意能上网的主机执行（WSL / Linux 均可）：
+
+```bash
+# 1) DNS
+nslookup tokynflow.com
+nslookup ws.tokynflow.com
+
+# 2) TCP 端口
+curl -s -o /dev/null -w "8000:%{http_code}
+" --max-time 5 http://tokynflow.com:8000/xiaozhi/v1/
+
+# 3) WebSocket 握手（成功返回 101）
+curl -s -i -N --max-time 8   -H 'Connection: Upgrade' -H 'Upgrade: websocket'   -H 'Sec-WebSocket-Version: 13'   -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=='   http://tokynflow.com:8000/xiaozhi/v1/ | head -12
+```
+
+**本次实测结果**：
+
+| 地址 | 结果 | 判定 |
+|---|---|---|
+| DNS（两个域名） | 都解析到 `47.84.226.245` | ✅ |
+| `tokynflow.com:8000` | `101 Switching Protocols` | ✅ 服务正常 |
+| `ws.tokynflow.com:8000` | `101 Switching Protocols` | ✅ |
+| **`ws.tokynflow.com`（不带端口，走 80）** | **`301 Moved Permanently` → `https://…`** | ❌ **根因** |
+| `https://tokynflow.com/xiaozhi/v1/` | `200`（非 WS 握手） | ⚠️ 需确认是否透传 Upgrade |
+
+### 2. 根因：域名被强制 301 跳 HTTPS，而 ESP32 不做 WS 协议升级跳转
+
+Nginx/openresty 对 80 端口做了 HTTPS 强制跳转：
+
+```
+HTTP/1.1 301 Moved Permanently
+Server: openresty
+Location: https://ws.tokynflow.com/xiaozhi/v1/
+```
+
+**ESP32 的 WebSocket 客户端不会跟随 301 去建立 TLS 连接**，于是握手直接失败。
+而**直接指定端口**（`:8000`）时不经过 80 端口的跳转规则，握手正常（101）。
+
+### 3. 方案 A（最快，不改服务端）：用直连端口的 ws 地址
+
+```sql
+UPDATE sys_params
+SET param_value = 'ws://tokynflow.com:8000/xiaozhi/v1/'
+WHERE param_code = 'server.websocket';
+```
+
+执行位置（云服务器）：
+
+```bash
+docker exec xiaozhi-esp32-server-db sh -c \
+  "mysql -uroot -p123456 -e \"UPDATE xiaozhi_esp32_server.sys_params \
+   SET param_value='ws://tokynflow.com:8000/xiaozhi/v1/' \
+   WHERE param_code='server.websocket';\""
+
+# 让设备重新拉取配置
+docker restart xiaozhi-esp32-server
+```
+
+然后**复位设备**（设备会缓存服务端下发的 websocket 地址）。
+
+> 前提：云服务器安全组/防火墙放行 **8000**（本次实测已放行）。
+
+### 4. 方案 B（更规范）：`wss://` 走 443 + Nginx 透传 Upgrade
+
+在 openresty 增加（注意四个 `proxy_set_header` 与超时）：
+
+```nginx
+location /xiaozhi/v1/ {
+    proxy_pass http://172.20.217.72:8000;   # 或容器名 xiaozhi-esp32-server:8000
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_read_timeout 3600s;               # WS 长连接，必须放大
+    proxy_send_timeout 3600s;
+}
+```
+
+参数改为：
+
+```sql
+UPDATE sys_params SET param_value='wss://ws.tokynflow.com/xiaozhi/v1/'
+WHERE param_code='server.websocket';
+```
+
+**关键点**：缺 `Upgrade` / `Connection` 头会导致握手返回 `400`/`502`；
+`proxy_read_timeout` 太小会导致对话中途被断开。
+
+### 5. 同时必须核对的其它公网参数
+
+| 参数 | 应填 | 说明 |
+|---|---|---|
+| `server.ota` | `http://tokynflow.com:8002/xiaozhi/ota/` | 决定设备能否激活 |
+| `server.websocket` | `ws://tokynflow.com:8000/xiaozhi/v1/` | 决定设备能否对话 |
+| `server.auth.enabled` | `false` | 否则未带 token 的设备被拒（日志 `connection rejected (200 OK)`） |
+| ASR `FunASR.language` | `zh` | 否则 SenseVoice 会误判为 en/ko |
+
+以及容器内 `data/.config.yaml`：
+
+```yaml
+server:
+  ip: 0.0.0.0
+  port: 8000
+  http_port: 8003
+  vision_explain: http://tokynflow.com:8003/mcp/vision/explain   # 必须 http:// 两个斜杠
+manager-api:
+  url: http://xiaozhi-esp32-server-web:8002/xiaozhi
+  secret: <智控台【参数管理】server.secret>
+```
+
+安全组放行 **8000 / 8002 / 8003**。
+
+### 6. 排障速查
+
+| 现象 | 首查 |
+|---|---|
+| `301 Moved Permanently` | 域名被强制 HTTPS，改用带端口的 `ws://host:8000/...` 或配 `wss://` |
+| WS 握手 `400` / `502` | Nginx 未透传 `Upgrade` / `Connection` 头 |
+| 握手成功但对话秒断 | `proxy_read_timeout` 太小 |
+| `connection rejected (200 OK)` | `server.auth.enabled=true` 且设备未在白名单 |
+| 设备一直 activating | `server.ota` 不可达（先用 curl 测 `/xiaozhi/ota/`） |
+| 改了参数设备无变化 | 设备缓存：需**复位设备**重新拉配置 |
+
