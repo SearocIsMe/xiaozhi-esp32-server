@@ -1960,3 +1960,189 @@ voiceprint:
 | `VOICEPRINT_URL_LOCALHOST` | 填了 localhost / 127.0.0.1，改为容器名 |
 | `声纹识别失败: ...` | identify 接口报错，看自建服务日志 |
 | 识别结果总是 unknown | 未注册声纹，或相似度低于 `similarity_threshold`（可适当下调到 0.3） |
+
+---
+
+## 附十二：配网后「无法访问绑定页 / 绑不上设备」—— `server.fronted_url` 域名不可达
+
+> 现象：设备配网成功、OTA 也有响应，但 LCD 提示的绑定网址打不开，导致无法在智控台绑定设备。
+> **根因：`server.fronted_url` 指向了一个 TLS 不可用的域名（如证书不含 `www`）。**
+
+### 1. 先分清两件事（避免误判为「网络事故」）
+
+| 环节 | 是否正常 | 判据 |
+|---|---|---|
+| 设备 → OTA 接口 | ✅ 正常 | 服务端日志有 `Ota: Current version`；返回里有 `activation.code` |
+| 用户 → **绑定页地址** | ❌ **失败** | LCD 上那个 URL 打不开（本文根因） |
+
+**关键**：OTA 是成功的，失败的是「设备告诉用户去哪个网址绑定」这一步。
+
+### 2. 定位方法（三步实测）
+
+#### ① 直接请求 OTA，看返回的激活信息
+
+```bash
+curl -s -X POST 'http://tokynflow.com:8002/xiaozhi/ota/' \
+  -H 'Content-Type: application/json' \
+  -H 'Device-Id: 1c:29:04:31:11:88' \
+  -H 'Client-Id: 1c:29:04:31:11:88' \
+  -d '{"application":{"version":"2.5.2"},"board":{"type":"bread-compact-wifi-s3cam"}}'
+```
+
+实测返回（2026-11-01）：
+
+```json
+{
+  "server_time": {...},
+  "activation": {
+    "code": "798216",
+    "message": "https://www.tokynflow.com\n798216",   ← 就是这个地址
+    "challenge": "1c:29:04:31:11:88"
+  },
+  "firmware": {
+    "version": "2.5.2",
+    "url": "http://xiaozhi.server.com:8002/xiaozhi/otaMag/download/NOT_ACTIVATED_FIRMWARE_THIS_IS_A_INVALID_URL"
+  },
+  "websocket": { "url": "wss://ws.tokynflow.com/xiaozhi/v1/", "token": "" }
+}
+```
+
+> `firmware.url` 的 `NOT_ACTIVATED_FIRMWARE_THIS_IS_A_INVALID_URL` 是**未绑定时的正常占位**，绑定后消失，不用处理。
+
+#### ② 逐个验证候选地址的可用性
+
+```bash
+for u in \
+  'http://tokynflow.com:8002/xiaozhi/ota/' \
+  'https://tokynflow.com/xiaozhi/ota/' \
+  'https://www.tokynflow.com/xiaozhi/ota/'
+do
+  printf '%-46s ' "$u"
+  curl -s -o /dev/null -m 8 -w 'HTTP=%{http_code}\n' -X POST "$u" \
+    -H 'Content-Type: application/json' \
+    -H 'Device-Id: 1c:29:04:31:11:88' \
+    -d '{"application":{"version":"2.5.2"},"board":{"type":"bread-compact-wifi-s3cam"}}'
+done
+```
+
+实测结果：
+
+| 地址 | HTTP | 判定 |
+|---|---|---|
+| `http://tokynflow.com:8002/xiaozhi/ota/` | **200** | ✅ |
+| `https://tokynflow.com/xiaozhi/ota/` | **200** | ✅ |
+| **`https://www.tokynflow.com/xiaozhi/ota/`** | **000** | ❌ **SSL 握手失败** |
+
+`000` 表示**连接建立失败**（非 HTTP 状态）。用浏览器验证同域名会看到
+「无法建立 SSL/TLS 安全通道」——原因是**证书未包含 `www` SAN**。
+
+#### ③ 确认该地址来自哪个参数
+
+源码（[`DeviceServiceImpl.java:472-487`](../../main/manager-api/src/main/java/xiaozhi/modules/device/service/impl/DeviceServiceImpl.java)）：
+
+```java
+public DeviceReportRespDTO.Activation buildActivation(String deviceId, DeviceReportReqDTO deviceReport) {
+    ...
+    String frontedUrl = sysParamsService.getValue(Constant.SERVER_FRONTED_URL, true);
+    code.setMessage(frontedUrl + "\n" + cachedCode);   // ← LCD 显示的就是它
+```
+
+即：**`server.fronted_url` 被原样拼进 activation.message**。
+
+#### ④ 查当前配置值
+
+```bash
+docker exec xiaozhi-esp32-server-db sh -c \
+"mysql -uroot -p123456 -t -e \"
+ SELECT param_code, IFNULL(param_value,'<NULL>') AS val
+ FROM xiaozhi_esp32_server.sys_params
+ WHERE param_code IN ('server.fronted_url','server.ota','server.websocket','server.auth.enabled');
+\""
+```
+
+### 3. 修复
+
+**方案 1（推荐）：改为证书有效的地址**
+
+```sql
+UPDATE sys_params SET param_value='https://tokynflow.com'
+WHERE param_code='server.fronted_url';
+```
+
+完整执行：
+
+```bash
+docker exec xiaozhi-esp32-server-db sh -c \
+  "mysql -uroot -p123456 -e \"
+   UPDATE xiaozhi_esp32_server.sys_params
+   SET param_value='https://tokynflow.com'
+   WHERE param_code='server.fronted_url';
+  \""
+
+docker restart xiaozhi-esp32-server
+```
+
+**方案 2：给 `www` 补证书**
+- 在 openresty 证书中加入 `www.tokynflow.com` 的 SAN，或
+- 单独为 `www` 配置一个包含 `www` 的证书
+
+**方案 3：改用带端口的 http**
+
+```sql
+UPDATE sys_params SET param_value='http://tokynflow.com:8002'
+WHERE param_code='server.fronted_url';
+```
+
+### 4. 验证修复
+
+```bash
+# ① 参数已改
+docker exec xiaozhi-esp32-server-db sh -c \
+"mysql -uroot -p123456 -N -e \"SELECT param_value FROM xiaozhi_esp32_server.sys_params WHERE param_code='server.fronted_url';\""
+
+# ② 新地址可访问（浏览器也能打开）
+curl -s -o /dev/null -w 'HTTP=%{http_code}\n' -m 8 https://tokynflow.com/
+
+# ③ 重新取 OTA，确认 message 里的地址已变
+curl -s -X POST 'http://tokynflow.com:8002/xiaozhi/ota/' \
+  -H 'Content-Type: application/json' -H 'Device-Id: 1c:29:04:31:11:88' \
+  -d '{"application":{"version":"2.5.2"},"board":{"type":"bread-compact-wifi-s3cam"}}' \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['activation']['message'])"
+```
+
+期望输出：
+
+```
+https://tokynflow.com
+<6位验证码>
+```
+
+**④ 复位设备**，让 LCD 刷新绑定地址；再用浏览器打开该地址输入验证码完成绑定。
+
+### 5. 为什么「重启服务端」还不够
+
+`activation.message` 是**每次 OTA 请求时现算**的（`buildActivation` 每次都读参数），
+所以严格来说改完参数**下一次 OTA 就会生效**。但设备会缓存上一次的 OTA 结果，
+**复位设备**能确保它立刻重新拉取。
+
+### 6. 顺带核对：这三个参数构成完整的对外地址面
+
+| 参数 | 作用 | 谁消费 |
+|---|---|---|
+| `server.ota` | 设备做 OTA 的地址 | 设备（门户/编译默认） |
+| `server.websocket` | 设备连对话服务的地址 | 设备（OTA 响应下发） |
+| `server.fronted_url` | **LCD 上显示的绑定页地址** | 用户（浏览器） |
+
+**三者必须都可从「用户的网络」与「设备的网络」访问**。本次只有 `fronted_url` 不可达。
+
+### 7. 排障速查
+
+| 现象 | 首查 |
+|---|---|
+| LCD 有验证码但网址打不开 | `server.fronted_url` 的域名/证书 |
+| `curl` 该地址返回 `000` | TLS 失败：证书 SAN 不含该子域，或端口不对 |
+| 地址返回 301/302 到 https | 用户浏览器可跟随，但确认最终地址证书有效 |
+| OTA 完全无响应 | `server.ota` 不可达 → 见附九 |
+| 有验证码但设备列表里不出现 | 绑定动作未完成（用户未提交验证码） |
+| 绑定后 `firmware.url` 仍为 INVALID | 正常：未绑定占位符；绑定后重新 OTA 即消失 |
+
