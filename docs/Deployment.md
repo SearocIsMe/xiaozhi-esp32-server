@@ -2146,3 +2146,215 @@ https://tokynflow.com
 | 有验证码但设备列表里不出现 | 绑定动作未完成（用户未提交验证码） |
 | 绑定后 `firmware.url` 仍为 INVALID | 正常：未绑定占位符；绑定后重新 OTA 即消失 |
 
+---
+
+## 附十三：设备 HTTPS OTA 报 `TLS handshake failed` —— 证书链里有固件「不认识」的中间 CA
+
+> 背景：把 OTA 改成 `https://tokynflow.com/xiaozhi/ota/`、`server.fronted_url=https://tokynflow.com`
+> 之后，设备串口仍然报下面这组错误（实测日志 `reports/xiaozhi_serial_tls.log`）：
+>
+> ```
+> I (2479) Ota: Current version: 2.5.2
+> I (2609) esp-x509-crt-bundle: No matching trusted root certificate found
+> E (2609) esp-x509-crt-bundle: Failed to verify certificate
+> E (2619) esp-tls-mbedtls: mbedtls_ssl_handshake returned -0x3000
+> E (2619) EspSsl: Failed to connect to tokynflow.com:443: TLS handshake failed (tls_failed, native=32794)
+> E (2639) Ota: Failed to open HTTP connection: TLS handshake failed
+> ```
+>
+> 结论先说：**这不是曲线问题、不是 TLS 版本问题、也不是 ESP-IDF 的 bug，而是这张证书的链路里
+> 有一个中间 CA（`Root YE`）在任何 ESP-IDF 预置 CA bundle 里都不存在。**
+
+### 1. 先排除三个常见的错误猜测（全部实测过）
+
+| 猜测 | 实测结果 | 结论 |
+|---|---|---|
+| 「P-384 曲线固件不支持」 | `build/config/sdkconfig.h` 里 `CONFIG_MBEDTLS_ECP_DP_SECP384R1_ENABLED 1` | **不是** |
+| 「TLS1.3 固件不支持」 | 固件 `CONFIG_MBEDTLS_SSL_PROTO_TLS1_2 1`；服务端 `-tls1_2` 可正常握手 | **不是** |
+| 「CA bundle 里没有 ISRG Root X1/X2」 | 解析 `build/x509_crt_bundle.S`：145 张，**X1/X2 都在** | **不是** |
+
+固件侧的 TLS 配置（`build/config/sdkconfig.h`，实测）：
+
+```
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE 1
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL 1
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_MAX_CERTS 200
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY 1
+CONFIG_MBEDTLS_SSL_PROTO_TLS1_2 1
+CONFIG_MBEDTLS_ECDSA_C 1
+CONFIG_MBEDTLS_ECP_DP_SECP256R1_ENABLED 1
+CONFIG_MBEDTLS_ECP_DP_SECP384R1_ENABLED 1
+```
+
+### 2. 真实证书链（4 张，逐层实测）
+
+抓链命令（Windows，管道给 cmd 容易坏，**先落盘再解析**）：
+
+```bat
+(echo Q | C:\ProgramData\anaconda3\Library\bin\openssl.exe s_client ^
+  -connect tokynflow.com:443 -servername tokynflow.com -showcerts -tls1_2) ^
+  > reports\tokynflow_chain.pem 2>nul
+```
+
+实测链（`scripts/tls_chain_probe.py` 输出）：
+
+| # | subject | issuer | isCA | 公钥 |
+|---|---|---|---|---|
+| 0 | `tokynflow.com` | `YE2` | 否 | ECDSA P-384 |
+| 1 | `YE2` | `Root YE` | 是 | ECDSA P-384 |
+| 2 | `Root YE` | `ISRG Root X2` | 是 | ECDSA P-384 |
+| 3 | `ISRG Root X2` | `ISRG Root X1` | 是 | ECDSA P-384 |
+
+关键点：**第 3 张不是自签根**，它的 issuer 是 `ISRG Root X1`。也就是说服务端把
+`ISRG Root X2`（由 X1 交叉签名的版本）也一起下发了，而真正的根 `ISRG Root X1`
+并没有下发。
+
+### 3. 为什么 ESP32 会失败：`esp_crt_verify_callback()` 的查找规则
+
+`esp-idf/components/mbedtls/esp_crt_bundle/esp_crt_bundle.c` 里：
+回调**只处理每一层的「第一个不受信环节」**，并用 `esp_crt_find_cert()` 在 bundle 中
+**按 DER 字节做二分查找 + memcmp**：
+
+```c
+static cert_t esp_crt_find_cert(const unsigned char* const issuer, const size_t issuer_len)
+{
+    ...
+    int cmp_res = memcmp(issuer, esp_crt_get_name(cert), MIN(issuer_len, cert_name_len));
+    if (cmp_res == 0) return cert;
+    ...
+}
+```
+
+即：**bundle 里必须存在一张证书，其 subject（DER 原样）恰好等于当前这层的 issuer**。
+它不会「顺着 AIA/链去拼一条到根的路径」，也不会做字符串归一化。
+
+用脚本可复现地验证这件事：
+
+```bat
+REM 1) 逐层打印 subject/issuer/公钥/SAN
+C:\ProgramData\anaconda3\python.exe scripts\tls_chain_probe.py ^
+  reports\tokynflow_chain.pem --bundle C:\esp-all\.espressif\v6.1\esp-idf\components\mbedtls\esp_crt_bundle\cacrt_all.pem --host tokynflow.com
+
+REM 2) 看固件真实编译进去的 bundle 有哪些 subject
+C:\ProgramData\anaconda3\python.exe scripts\crt_bundle_inspect.py ^
+  demo\esp32-s3-materials\xiaozhi-source\xiaozhi-esp32-2.5.2\build\x509_crt_bundle.S ^
+  --want "Root YE" --want "ISRG Root X1" --want "ISRG Root X2"
+
+REM 3) 逐层做 issuer DER vs bundle subject DER 的精确比对（这是判决性的一步）
+C:\ProgramData\anaconda3\python.exe scripts\crt_name_compare.py ^
+  reports\tokynflow_chain.pem ^
+  demo\esp32-s3-materials\xiaozhi-source\xiaozhi-esp32-2.5.2\build\x509_crt_bundle.S
+```
+
+实测输出（判决）：
+
+```
+[0] tokynflow.com --issuer--> YE2        NO match  (bundle 无 subject CN='YE2')
+[1] YE2           --issuer--> Root YE    NO match  (bundle 无 subject CN='Root YE')
+[2] Root YE       --issuer--> ISRG Root X2   EXACT byte match @ bundle[59]
+[3] ISRG Root X2  --issuer--> ISRG Root X1   EXACT byte match @ bundle[58]
+```
+
+所以校验在第 2 层（`YE2` 找 `Root YE`）就断了：**`Root YE` 这张 CA 在所有 ESP-IDF
+预置 bundle（`cacrt_all.pem` / `cacrt_deprecated.pem` / `cacrt_local.pem`）里都不存在**，
+`esp_crt_find_cert()` 返回 NULL → 打印 `No matching trusted root certificate found`
+→ `-0x3000 (MBEDTLS_ERR_X509_CERT_VERIFY_FAILED)`。
+
+另外确认：该域名**不提供 RSA 证书链**（强制 `ECDHE-RSA` 时 `Cipher is (NONE)`），
+所以「换 RSA 证书」不是零成本方案，需要服务端真的签发/安装 RSA 证书。
+
+### 4. 修复方案（按成本从低到高）
+
+#### 方案 A（强烈推荐，零固件改动）：把服务端证书换成「只下发到 ISRG Root X2 为止」的链
+
+让 Nginx 只下发 **leaf + `YE2` + `Root YE`** 三张（**不要**下发 `ISRG Root X2`
+那张由 X1 交叉签名的证书），同时保证服务端证书文件里 `Root YE` 的 issuer 与 bundle
+中 `ISRG Root X2` 的 subject 字节一致（LE 官方产物即是如此）。
+
+原理与 `esp_crt_find_cert()` 的行为完全吻合：
+
+- 层 `YE2` 的 issuer = `Root YE` → 不在 bundle
+- 层 `Root YE` 的 issuer = `ISRG Root X2` → **bundle[59] 精确命中**，`esp_crt_check_signature()`
+  用 bundle 里 X2 的公钥验 `Root YE` 的签名 → 通过 → `*flags = 0`
+- 再往上不再需要 X1
+
+即：**中间 CA 数量越少越好；根不要下发，交叉签名的那张反倒会制造一层查不到的 issuer。**
+
+验证判据（本机可先验，无需设备）：
+
+```bat
+(echo Q | C:\ProgramData\anaconda3\Library\bin\openssl.exe s_client ^
+  -connect tokynflow.com:443 -servername tokynflow.com -showcerts -tls1_2) ^
+  > reports\chain_after.pem 2>nul
+
+C:\ProgramData\anaconda3\python.exe scripts\tls_chain_probe.py reports\chain_after.pem --host tokynflow.com
+```
+
+要求输出满足：链长 3，且 `deepest certificate = Root YE` / `its issuer = ISRG Root X2`。
+
+#### 方案 B（固件侧解决，一次性成本高）：把 `Root YE` 加进自定义 CA bundle
+
+既然 `Root YE` 是全网新 CA，就把它的 PEM 放进 ESP-IDF 的本地增量 bundle：
+
+```bat
+REM cacrt_local.pem 会把内容合并进最终 bundle（CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL 下同样生效）
+copy /b C:\esp-all\.espressif\v6.1\esp-idf\components\mbedtls\esp_crt_bundle\cacrt_local.pem + ^
+        root_ye.pem ^
+        cacrt_local.new.pem
+```
+
+要点：
+1. `root_ye.pem` 必须是 **PEM**，且能 `openssl x509 -noout -subject` 正常解析；
+2. `cacrt_local.pem` 里**不要再加 `YE2`**（`YE2` 是中间 CA，加进去也不会被用到，
+   因为校验是「一层一层找 issuer」）；
+3. 改完必须**重新构建 + 重新烧录**，并复核：
+
+```bat
+C:\ProgramData\anaconda3\python.exe scripts\crt_bundle_inspect.py ^
+  demo\esp32-s3-materials\xiaozhi-source\xiaozhi-esp32-2.5.2\build\x509_crt_bundle.S --want "Root YE"
+```
+
+应输出 `'Root YE' -> PRESENT`。
+
+**注意**：`cacrt_local.pem` 属于 ESP-IDF 目录，会被 `install.bat`/升级覆盖，
+请把 `root_ye.pem` 与打补丁的步骤记进本项目的构建脚本，否则下次升级固件又会坏。
+
+#### 方案 C（当下要立刻恢复可用）：OTA 用 HTTP，对话用 `ws://`
+
+如果只是想立刻让设备能升级/能对话，避免在证书上纠缠：
+
+```sql
+UPDATE ai_model_config SET config_json = JSON_SET(config_json,
+    '$.server.ota',       'http://tokynflow.com/xiaozhi/ota/',
+    '$.server.websocket', 'ws://tokynflow.com:8000/xiaozhi/v1/'
+) WHERE config_json LIKE '%"server"%';
+```
+
+代价：明文传输（OTA 包与音频都在公网裸奔），**只建议临时救火**，
+不要当作长期方案（详见附九对 `ws://` 的说明）。
+
+#### 方案 D：换一张「根在老 bundle 里」的证书
+
+若你能控制签发：让证书链最终落到 `ISRG Root X1` 并**只下发 leaf + 中间 CA**
+（典型 Let's Encrypt **RSA** 证书，或自建 CA 且其根已在 `cacrt_all.pem`）。
+这与方案 A 同构，只是换成了 RSA 生态。
+
+### 5. 排障速查
+
+| 现象 | 首查 |
+|---|---|
+| `No matching trusted root certificate found` | `crt_name_compare.py`：哪一层的 issuer 在 bundle 里查不到 |
+| 想确认固件到底带了哪些根 | `crt_bundle_inspect.py build/x509_crt_bundle.S`（不是看 `cacrt_all.pem`！） |
+| `-0x3000` | 就是证书校验失败；不要在曲线/协议版本上浪费时间 |
+| 换了证书还是失败 | 服务端**多下发了根证书**或**交叉签名证书**，导致多出一层查不到的 issuer |
+| 固件里 `cacrt_local.pem` 加了还是不见 | 没有重新 build/reflash，或 PEM 格式不合法 |
+
+### 6. 诚实边界
+
+- 本文的链路与 bundle 结论全部来自本机实测（`openssl s_client` + 解析固件
+  `build/x509_crt_bundle.S` 的 145 张证书），不是推测。
+- 「方案 A 能通」是对照 `esp_crt_verify_callback()` 源码逻辑推导出的**必然结果**，
+  但**本文写作时尚未完成改链后的设备端实机复测**；请在改完后按 §4 的判据
+  抓一次链 + 再看串口是否出现 `Certificate validated`。
+- `Root YE` 是谁签发的、以及 Let's Encrypt 为何引入它，属于对端 CA 的运营决定，
+  本项目不做断言。
