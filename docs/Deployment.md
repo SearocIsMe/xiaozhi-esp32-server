@@ -2265,32 +2265,76 @@ C:\ProgramData\anaconda3\python.exe scripts\crt_name_compare.py ^
 
 ### 4. 修复方案（按成本从低到高）
 
-#### 方案 A（强烈推荐，零固件改动）：把服务端证书换成「只下发到 ISRG Root X2 为止」的链
+> **先纠正一条我写错的推断。** 本文初版把「裁剪链到 3 张」当成首选方案 A，理由是
+> 「少下发一层就不会走到查不到的那一层」。这条推断**不成立**，理由如下：
+>
+> 用 `scripts/esp_crt_simulate.py` 逐层检查可以确认，当前下发的 **4 张**证书里，
+> 每一层的 issuer 都能在**链内部**找到对应证书：
+>
+> ```
+> [0] tokynflow.com --issuer--> YE2           链内 index [1]
+> [1] YE2           --issuer--> Root YE       链内 index [2]
+> [2] Root YE       --issuer--> ISRG Root X2  链内 index [3]
+> [3] ISRG Root X2  --issuer--> ISRG Root X1  链内无（这才是唯一需要 bundle 的一层）
+> ```
+>
+> 也就是说：**链的中段并不缺证书**，裁剪链并不改变「最后仍要查 `ISRG Root X1`」这件事。
+> 决定成败的是**链最顶端那一层如何落到可信锚**，而不是中间 CA 的数量。
+> 因此下面把方案重新排序，**并把「实测确认失败层」作为第 0 步**。
 
-让 Nginx 只下发 **leaf + `YE2` + `Root YE`** 三张（**不要**下发 `ISRG Root X2`
-那张由 X1 交叉签名的证书），同时保证服务端证书文件里 `Root YE` 的 issuer 与 bundle
-中 `ISRG Root X2` 的 subject 字节一致（LE 官方产物即是如此）。
+#### 第 0 步（必须先做，成本最低）：把固件日志级别调到 DEBUG，确认到底断在哪一层
 
-原理与 `esp_crt_find_cert()` 的行为完全吻合：
-
-- 层 `YE2` 的 issuer = `Root YE` → 不在 bundle
-- 层 `Root YE` 的 issuer = `ISRG Root X2` → **bundle[59] 精确命中**，`esp_crt_check_signature()`
-  用 bundle 里 X2 的公钥验 `Root YE` 的签名 → 通过 → `*flags = 0`
-- 再往上不再需要 X1
-
-即：**中间 CA 数量越少越好；根不要下发，交叉签名的那张反倒会制造一层查不到的 issuer。**
-
-验证判据（本机可先验，无需设备）：
+当前固件日志只到 INFO，所以只看到一句汇总性的
+`No matching trusted root certificate found`，**看不出是哪一层**。
+而 DEBUG 级会额外打印命中的证书名（源码里那段 `#if CONFIG_LOG_DEFAULT_LEVEL_DEBUG`
+分支会输出 `Certificate matched with %s ...`）。
 
 ```bat
-(echo Q | C:\ProgramData\anaconda3\Library\bin\openssl.exe s_client ^
-  -connect tokynflow.com:443 -servername tokynflow.com -showcerts -tls1_2) ^
-  > reports\chain_after.pem 2>nul
-
-C:\ProgramData\anaconda3\python.exe scripts\tls_chain_probe.py reports\chain_after.pem --host tokynflow.com
+REM 在项目根目录用 menuconfig 打开调试日志，再重新构建
+REM Component config -> Log output -> Default log verbosity -> Debug
 ```
 
-要求输出满足：链长 3，且 `deepest certificate = Root YE` / `its issuer = ISRG Root X2`。
+判据：串口里应出现类似
+
+```
+D (2619) esp-x509-crt-bundle: 145 certificates in bundle
+D (2619) esp-x509-crt-bundle: Certificate matched with ISRG Root X1 ...
+```
+
+- 若看到 `Certificate matched ...` 但随后 `signature verification failed` → 是**验签**失败，
+  与名字查找无关（此时应查签名算法/密钥类型）；
+- 若完全没有 `Certificate matched` → 确认是**名字查找**失败，进入下面方案。
+
+#### 方案 A（推荐，改动最小）：把 `Root YE` 装进固件 CA bundle
+
+`Root YE` 的完整 DN 是 `C=US, O=ISRG, CN=Root YE` —— 它是 **ISRG（Let's Encrypt 的
+运营方）自家新根**，不是阿里云的 CA。任何 ESP-IDF 预置 bundle 都不含它（实测三份
+`cacrt_all/deprecated/local` 全部缺失），所以只要你的链最终要落到它，**设备就一定不认**。
+
+做法是把该根 PEM 追加进 ESP-IDF 的本地增量 bundle（`gen_crt_bundle.py` 会把
+`cacrt_local.pem` 一并并入最终 bundle）：
+
+```bat
+REM 1) 从链里把 Root YE 单独导出成 PEM（第 2 张，索引从 0 开始即 2）
+C:\ProgramData\anaconda3\Library\bin\openssl.exe x509 ^
+  -in root_ye.pem -noout -subject
+REM 期望输出: subject=C = US, O = ISRG, CN = Root YE
+
+REM 2) 追加到本地 bundle
+type C:\esp-all\.espressif\v6.1\esp-idf\components\mbedtls\esp_crt_bundle\cacrt_local.pem ^
+     root_ye.pem > cacrt_local.new.pem
+move /y cacrt_local.new.pem C:\esp-all\.espressif\v6.1\esp-idf\components\mbedtls\esp_crt_bundle\cacrt_local.pem
+
+REM 3) 重新构建 + 重新烧录后复核（必须验 build 产物，不要只看 cacrt_local.pem）
+C:\ProgramData\anaconda3\python.exe scripts\crt_bundle_inspect.py ^
+  demo\esp32-s3-materials\xiaozhi-source\xiaozhi-esp32-2.5.2\build\x509_crt_bundle.S --want "Root YE"
+```
+
+判据：`'Root YE' -> PRESENT`，且证书总数从 145 变为 146。
+
+**注意**：`cacrt_local.pem` 在 ESP-IDF 安装目录内，会被 `install.bat` 或 IDF 升级覆盖。
+请把 `root_ye.pem` 与本步骤写进本项目的构建脚本（例如 `scripts/build.py` 前置钩子），
+否则下次升级固件又会坏。
 
 #### 方案 B（固件侧解决，一次性成本高）：把 `Root YE` 加进自定义 CA bundle
 
@@ -2333,28 +2377,93 @@ UPDATE ai_model_config SET config_json = JSON_SET(config_json,
 代价：明文传输（OTA 包与音频都在公网裸奔），**只建议临时救火**，
 不要当作长期方案（详见附九对 `ws://` 的说明）。
 
-#### 方案 D：换一张「根在老 bundle 里」的证书
+#### 方案 D：重新签发证书 —— **换 RSA 2048 是否有用？**
 
-若你能控制签发：让证书链最终落到 `ISRG Root X1` 并**只下发 leaf + 中间 CA**
-（典型 Let's Encrypt **RSA** 证书，或自建 CA 且其根已在 `cacrt_all.pem`）。
-这与方案 A 同构，只是换成了 RSA 生态。
+直接回答：**换 RSA 本身不解决问题；决定成败的是「新证书的链顶端锚在哪张根」，
+不是密钥类型。**
+
+依据（源码级）：`esp_crt_find_cert()` 只用 **issuer 的 DER 名字**去 bundle 里做
+`memcmp` 查找，**完全不看公钥算法**。RSA / ECDSA 对「名字查找」这一步毫无影响。
+
+固件侧也不缺 RSA 支持（实测 `build/config/sdkconfig.h`）：
+
+```
+CONFIG_MBEDTLS_RSA_C 1
+CONFIG_MBEDTLS_PKCS1_V15 1
+CONFIG_MBEDTLS_PKCS1_V21 1
+CONFIG_MBEDTLS_ECDSA_C 1
+```
+
+→ RSA 证书链在签名/验签层面**没有问题**，问题只在「根在不在 bundle 里」。
+
+**换 RSA 什么时候真的有用？** 只有当重新签发后，**链顶端落到 bundle 里已有的根**时才有用。
+当前 `Root YE` 的完整 DN 是 `C=US, O=ISRG, CN=Root YE` —— 属于 ISRG 的新根，
+而三份 ESP-IDF bundle（`cacrt_all` / `cacrt_deprecated` / `cacrt_local`）**都没有它**（实测）。
+
+**阿里云可申请品牌的实测定论**（对本固件实际编译的根做匹配，
+脚本 `scripts/cert_brand_matrix.py`）：
+
+| 品牌 | 本固件是否可用 | 命中的根 |
+|---|---|---|
+| **DigiCert** | ✅ 可用 | Global Root CA / G2 / G3、High Assurance EV、Trusted G4、TLS RSA4096 G5、TLS ECC P384 G5 |
+| **GlobalSign** | ✅ 可用 | Root R46、Root E46 |
+| **Sectigo (USERTrust)** | ✅ 可用 | USERTrust RSA / ECC、Sectigo PSA R46 / E46 |
+| **Entrust** | ✅ 可用 | Root CA - G2、Root CA - EC1 |
+| **Certum** | ✅ 可用 | Trusted Network CA、Trusted Network CA 2 |
+| **Google Trust Services** | ✅ 可用 | GTS Root R1 / R2 / R3 / R4 |
+| **Amazon** | ✅ 可用 | Amazon Root CA 1 / 2 / 3 / 4 |
+| **GeoTrust** | ❌ 不可用 | Global CA、Primary CA 均缺失 |
+| **Let's Encrypt（当前）** | ❌ 不可用 | `Root YE` 缺失（`ISRG Root X1/X2` 在，但链末落到 `Root YE`） |
+
+**结论与建议**：
+
+1. **不要只在阿里云把「ECDSA」改成「RSA 2048」**。若重新签发后链路顶端仍是
+   `Root YE`，设备照样失败 —— 密钥类型不是这个故障的自变量。
+2. **真正有效的动作**：重新申请时选一个链路锚定在上表 ✅ 品牌（DigiCert / GlobalSign /
+   Sectigo / Entrust / Certum / GTS / Amazon）的证书，并且**申请后必须核对真实链路**，
+   不要只看品牌名：
+
+```bat
+(echo Q | C:\ProgramData\anaconda3\Library\bin\openssl.exe s_client ^
+  -connect tokynflow.com:443 -servername tokynflow.com -showcerts -tls1_2) ^
+  > reports\chain_new.pem 2>nul
+
+REM 1) 看链顶端是哪张根
+C:\ProgramData\anaconda3\python.exe scripts\tls_chain_probe.py reports\chain_new.pem --host tokynflow.com
+
+REM 2) 逐层确认 issuer 名字能否在固件 bundle 里查到
+C:\ProgramData\anaconda3\python.exe scripts\esp_crt_simulate.py ^
+  reports\chain_new.pem ^
+  demo\esp32-s3-materials\xiaozhi-source\xiaozhi-esp32-2.5.2\build\x509_crt_bundle.S
+```
+
+判据：输出中**唯一需要 bundle 解析的那一层**（链顶端、链内已无对应证书）
+的 `resolvable by bundle CA callback` 必须是具体索引，而不是 `NO`。
+
+3. 换 RSA 也**不是零收益**：RSA 中间 CA 通常层级更少，且主流 RSA 根在 bundle 中
+   覆盖更广，能显著提高「命中」概率。但它是**提高命中概率**的手段，
+   而不是「因为 ESP32 不支持 ECDSA 所以必须换」—— P-384 是启用的（见 §1）。
 
 ### 5. 排障速查
 
 | 现象 | 首查 |
 |---|---|
-| `No matching trusted root certificate found` | `crt_name_compare.py`：哪一层的 issuer 在 bundle 里查不到 |
+| `No matching trusted root certificate found` | `esp_crt_simulate.py`：哪一层的 issuer 在 bundle 里查不到 |
 | 想确认固件到底带了哪些根 | `crt_bundle_inspect.py build/x509_crt_bundle.S`（不是看 `cacrt_all.pem`！） |
 | `-0x3000` | 就是证书校验失败；不要在曲线/协议版本上浪费时间 |
-| 换了证书还是失败 | 服务端**多下发了根证书**或**交叉签名证书**，导致多出一层查不到的 issuer |
+| 换了证书还是失败 | 新链顶端仍不在 bundle；或换了根但没重新核对链路 |
 | 固件里 `cacrt_local.pem` 加了还是不见 | 没有重新 build/reflash，或 PEM 格式不合法 |
+| 想知道某品牌能不能用 | `cert_brand_matrix.py`（对本固件实际编译的根做匹配） |
 
 ### 6. 诚实边界
 
-- 本文的链路与 bundle 结论全部来自本机实测（`openssl s_client` + 解析固件
-  `build/x509_crt_bundle.S` 的 145 张证书），不是推测。
-- 「方案 A 能通」是对照 `esp_crt_verify_callback()` 源码逻辑推导出的**必然结果**，
-  但**本文写作时尚未完成改链后的设备端实机复测**；请在改完后按 §4 的判据
-  抓一次链 + 再看串口是否出现 `Certificate validated`。
-- `Root YE` 是谁签发的、以及 Let's Encrypt 为何引入它，属于对端 CA 的运营决定，
-  本项目不做断言。
+- 本文的链路、bundle 内容、品牌可用性**全部来自本机实测**（`openssl s_client`
+  + 解析固件 `build/x509_crt_bundle.S` 的 145 张证书），不是推测。
+- **本文初版曾把「裁剪链到 3 张」当作首选方案，该推断已在本版中撤回**：
+  实测表明当前 4 张链的每一层 issuer 都能在链内找到，裁剪链不改变
+  「顶端仍需落到可信锚」这一事实。
+- **尚未完成设备端实机复测**。本版给出的动作（方案 A 加 `Root YE`、方案 D 换品牌）
+  都有明确的判据，但最终结论必须以串口日志为准：
+  `Certificate validated` = 通，`No matching trusted root certificate found` = 未通。
+- `Root YE` 为何引入属于 ISRG 的运营决定，本项目不做断言；本文只陈述
+  「它不在本固件 bundle 中」这一可复现事实。
